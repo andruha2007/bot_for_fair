@@ -1,9 +1,11 @@
-# vk_server.py
-import requests
-import time
-import random
+import json
 import logging
-from typing import Optional, Callable, Dict, Any
+import random
+import time
+from typing import Any, Callable, Dict, Optional
+
+import requests
+
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -11,120 +13,130 @@ logger = logging.getLogger(__name__)
 
 class VKLongPollServer:
     def __init__(self, token: str, group_id: int, api_version: str = "5.131"):
-        # Проверка токена при инициализации
-        if not token or token.startswith("vk1.a.ВАШ"):
-            raise ValueError("❌ Неверный VK_BOT_TOKEN. Проверьте файл .env")
-
         self.token = token
         self.group_id = group_id
         self.api_version = api_version
+        self.server_url: Optional[str] = None
+        self.server_key: Optional[str] = None
+        self.server_ts: Optional[str] = None
 
     def _api_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Универсальный метод для запросов к VK API"""
         url = f"https://api.vk.ru/method/{method}"
-        params.update({
+        params = {
+            **params,
             "access_token": self.token,
-            "v": self.api_version
-        })
-        resp = requests.post(url, params=params, timeout=10)
-        return resp.json()
+            "v": self.api_version,
+        }
+        try:
+            response = requests.post(url, params=params, timeout=10)
+            return response.json()
+        except Exception as exc:
+            logger.error("VK API request %s failed: %s", method, exc, exc_info=True)
+            return {"error": {"error_msg": str(exc)}}
 
     def _get_longpoll_server(self) -> bool:
-        """Получает новые данные для Long Poll"""
-        resp = self._api_request("groups.getLongPollServer", {"group_id": self.group_id})
-        if "response" not in resp:
-            logger.error(f"❌ Ошибка получения Long Poll сервера: {resp}")
+        response = self._api_request("groups.getLongPollServer", {"group_id": self.group_id})
+        data = response.get("response")
+        if not data:
+            logger.error("Long Poll server error: %s", response)
             return False
 
-        self.server_url = resp["response"]["server"]
-        self.server_key = resp["response"]["key"]
-        self.server_ts = resp["response"]["ts"]
-        logger.info(f"✅ Подключен к Long Poll серверу: {self.server_url}")
+        self.server_url = data["server"]
+        self.server_key = data["key"]
+        self.server_ts = data["ts"]
+        logger.info("Connected to VK Long Poll")
         return True
 
-    def send_message(self, user_id: int, text: str, keyboard: Optional[Dict] = None) -> Dict[str, Any]:
-        """Отправляет сообщение пользователю"""
-        params = {
+    def send_message(self, user_id: int, text: str, keyboard: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
             "user_id": user_id,
             "message": text,
-            "random_id": random.randint(0, 2 ** 31)
+            "random_id": random.randint(1, 2**31 - 1),
         }
         if keyboard:
-            params["keyboard"] = str(keyboard).replace("'", '"')  # VK требует JSON-строку
+            params["keyboard"] = keyboard if isinstance(keyboard, str) else json.dumps(keyboard, ensure_ascii=False)
 
-        resp = self._api_request("messages.send", params)
-        if "error" in resp:
-            logger.error(f"❌ Ошибка отправки сообщения {user_id}: {resp['error']}")
-        return resp
+        response = self._api_request("messages.send", params)
+        if "error" in response:
+            logger.error("Failed to send message to %s: %s", user_id, response["error"])
+        return response
 
-    def start_polling(self, message_handler: Callable[[int, str], None],
-                      callback_handler: Optional[Callable[[int, Dict], None]] = None):
-        """
-        Запускает цикл Long Poll.
-        message_handler: функция для обработки текстовых сообщений (user_id, text)
-        callback_handler: функция для обработки callback-событий (user_id, payload)
-        """
+    def start_polling(
+        self,
+        message_handler: Callable[[int, str, Optional[Any]], None],
+        callback_handler: Optional[Callable[[int, Dict[str, Any]], None]] = None,
+    ):
         if not self._get_longpoll_server():
+            logger.error("Cannot start Long Poll. Bot stopped.")
             return
 
-        logger.info(f"🚀 Бот запущен! Жду события... (Ctrl+C для остановки)")
+        logger.info("Bot started. Waiting for events...")
 
         while True:
             try:
-                resp = requests.get(
+                response = requests.get(
                     self.server_url,
                     params={
                         "act": "a_check",
                         "key": self.server_key,
                         "ts": self.server_ts,
                         "wait": config.LP_WAIT_TIME,
-                        "v": self.api_version
+                        "v": self.api_version,
                     },
-                    timeout=config.LP_WAIT_TIME + 5
+                    timeout=config.LP_WAIT_TIME + 5,
                 )
-                data = resp.json()
+                data = response.json()
 
-                # Обработка ошибок Long Poll
                 if "failed" in data:
-                    logger.warning(f"⚠️ Long Poll ошибка: {data.get('failed')}, переподключение...")
+                    logger.warning("Long Poll failed: %s", data.get("failed"))
                     time.sleep(2)
-                    if not self._get_longpoll_server():
-                        time.sleep(5)
+                    self._get_longpoll_server()
                     continue
 
                 self.server_ts = data["ts"]
 
-                # Обработка событий
                 for event in data.get("updates", []):
                     event_type = event.get("type")
 
                     if event_type == "message_new":
-                        msg = event["object"]["message"]
-                        user_id = msg["from_id"]
-                        text = msg.get("text", "").strip()
-                        message_handler(user_id, text)
+                        message = event.get("object", {}).get("message", {})
+                        user_id = message.get("from_id")
+                        if not user_id:
+                            continue
+                        text = message.get("text", "").strip()
+                        payload = message.get("payload")
+                        try:
+                            message_handler(user_id, text, payload)
+                        except Exception as exc:
+                            logger.error("Message handler failed for %s: %s", user_id, exc, exc_info=True)
+                            self.send_message(user_id, "Произошла ошибка. Напишите /help или попробуйте позже.")
 
                     elif event_type == "message_event" and callback_handler:
-                        # Обработка inline-кнопок (callback)
-                        obj = event["object"]
-                        user_id = obj["user_id"]
-                        payload_str = obj.get("payload", "{}")
-                        try:
-                            import json
-                            payload = json.loads(payload_str)
-                            callback_handler(user_id, payload)
-                        except json.JSONDecodeError:
-                            logger.error(f"❌ Ошибка парсинга payload: {payload_str}")
+                        obj = event.get("object", {})
+                        user_id = obj.get("user_id")
+                        payload = obj.get("payload", {})
+                        if isinstance(payload, str):
+                            try:
+                                payload = json.loads(payload)
+                            except json.JSONDecodeError:
+                                logger.error("Cannot parse callback payload: %s", payload)
+                                payload = {}
+                        if user_id:
+                            try:
+                                callback_handler(user_id, payload)
+                            except Exception as exc:
+                                logger.error("Callback handler failed for %s: %s", user_id, exc, exc_info=True)
+                                self.send_message(user_id, "Не удалось обработать кнопку. Попробуйте открыть меню заново.")
 
             except requests.exceptions.Timeout:
-                continue  # Нормальная ситуация, повторяем запрос
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"⚠️ Ошибка соединения: {e}, переподключение...")
-                time.sleep(5)
+                continue
+            except requests.exceptions.RequestException as exc:
+                logger.warning("Connection error: %s", exc)
+                time.sleep(3)
                 self._get_longpoll_server()
             except KeyboardInterrupt:
-                logger.info("👋 Бот остановлен пользователем")
+                logger.info("Bot stopped by user")
                 break
-            except Exception as e:
-                logger.error(f"❌ Неожиданная ошибка: {e}", exc_info=True)
+            except Exception as exc:
+                logger.error("Critical Long Poll loop error: %s", exc, exc_info=True)
                 time.sleep(5)

@@ -11,6 +11,10 @@ env_path = BASE_DIR / ".env" if (BASE_DIR / ".env").exists() else Path(__file__)
 load_dotenv(env_path)
 
 
+def _parse_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 @dataclass
 class Config:
     """
@@ -27,6 +31,8 @@ class Config:
 
     # === Администраторы ===
     INITIAL_SUPER_ADMIN: int = int(os.getenv("INITIAL_SUPER_ADMIN", "0"))
+    ADMIN_TAGS: list[str] = None
+    ADMIN_IDS: list[int] = None
 
     # === Long Poll ===
     LP_WAIT_TIME: int = int(os.getenv("LP_WAIT_TIME", "25"))
@@ -48,6 +54,13 @@ class Config:
 
     def __post_init__(self):
         """Авто-валидация при создании"""
+        self.ADMIN_TAGS = _parse_csv(os.getenv("ADMIN_TAGS", ""))
+        self.ADMIN_IDS = []
+        for value in _parse_csv(os.getenv("ADMIN_IDS", "")):
+            try:
+                self.ADMIN_IDS.append(int(value))
+            except ValueError:
+                pass
         errors = self.validate()
         if errors:
             import logging
