@@ -5,6 +5,8 @@ import time
 from typing import Any, Callable, Dict, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from config import config
 
@@ -19,6 +21,19 @@ class VKLongPollServer:
         self.server_url: Optional[str] = None
         self.server_key: Optional[str] = None
         self.server_ts: Optional[str] = None
+        self.session = requests.Session()
+        retry = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "POST"}),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def _api_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         url = f"https://api.vk.ru/method/{method}"
@@ -28,11 +43,15 @@ class VKLongPollServer:
             "v": self.api_version,
         }
         try:
-            response = requests.post(url, params=params, timeout=10)
+            response = self.session.post(url, params=params, timeout=(5, 15))
+            response.raise_for_status()
             return response.json()
-        except Exception as exc:
-            logger.error("VK API request %s failed: %s", method, exc, exc_info=True)
-            return {"error": {"error_msg": str(exc)}}
+        except requests.exceptions.RequestException as exc:
+            logger.warning("VK API request %s failed: %s", method, exc.__class__.__name__)
+            return {"error": {"error_msg": f"network error: {exc.__class__.__name__}"}}
+        except ValueError:
+            logger.warning("VK API request %s returned invalid JSON", method)
+            return {"error": {"error_msg": "invalid json"}}
 
     def _get_longpoll_server(self) -> bool:
         response = self._api_request("groups.getLongPollServer", {"group_id": self.group_id})
@@ -61,20 +80,36 @@ class VKLongPollServer:
             logger.error("Failed to send message to %s: %s", user_id, response["error"])
         return response
 
+    def get_user_info(self, user_id: int) -> Dict[str, str]:
+        response = self._api_request("users.get", {"user_ids": user_id, "fields": "screen_name"})
+        data = response.get("response") or []
+        if not data:
+            return {}
+        user = data[0]
+        first = user.get("first_name") or ""
+        last = user.get("last_name") or ""
+        return {
+            "display_name": " ".join(part for part in (first, last) if part).strip(),
+            "screen_name": user.get("screen_name") or f"id{user_id}",
+        }
+
     def start_polling(
         self,
-        message_handler: Callable[[int, str, Optional[Any]], None],
+        message_handler: Callable[..., None],
         callback_handler: Optional[Callable[[int, Dict[str, Any]], None]] = None,
     ):
-        if not self._get_longpoll_server():
-            logger.error("Cannot start Long Poll. Bot stopped.")
-            return
+        retry_delay = 3
+        while not self._get_longpoll_server():
+            logger.warning("Cannot connect to VK Long Poll. Retrying in %s sec.", retry_delay)
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
 
         logger.info("Bot started. Waiting for events...")
+        retry_delay = 3
 
         while True:
             try:
-                response = requests.get(
+                response = self.session.get(
                     self.server_url,
                     params={
                         "act": "a_check",
@@ -85,12 +120,17 @@ class VKLongPollServer:
                     },
                     timeout=config.LP_WAIT_TIME + 5,
                 )
+                response.raise_for_status()
                 data = response.json()
 
                 if "failed" in data:
                     logger.warning("Long Poll failed: %s", data.get("failed"))
                     time.sleep(2)
-                    self._get_longpoll_server()
+                    while not self._get_longpoll_server():
+                        logger.warning("Cannot refresh Long Poll server. Retrying in %s sec.", retry_delay)
+                        time.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 2, 60)
+                    retry_delay = 3
                     continue
 
                 self.server_ts = data["ts"]
@@ -106,7 +146,7 @@ class VKLongPollServer:
                         text = message.get("text", "").strip()
                         payload = message.get("payload")
                         try:
-                            message_handler(user_id, text, payload)
+                            message_handler(user_id, text, payload, self.get_user_info(user_id))
                         except Exception as exc:
                             logger.error("Message handler failed for %s: %s", user_id, exc, exc_info=True)
                             self.send_message(user_id, "Произошла ошибка. Напишите /help или попробуйте позже.")
@@ -131,9 +171,14 @@ class VKLongPollServer:
             except requests.exceptions.Timeout:
                 continue
             except requests.exceptions.RequestException as exc:
-                logger.warning("Connection error: %s", exc)
-                time.sleep(3)
-                self._get_longpoll_server()
+                logger.warning("Connection error: %s. Retrying in %s sec.", exc.__class__.__name__, retry_delay)
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)
+                while not self._get_longpoll_server():
+                    logger.warning("Cannot refresh Long Poll server. Retrying in %s sec.", retry_delay)
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
+                retry_delay = 3
             except KeyboardInterrupt:
                 logger.info("Bot stopped by user")
                 break

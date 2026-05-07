@@ -72,7 +72,7 @@ class FairBotLogic:
 
     @staticmethod
     def _money(value: float) -> str:
-        return f"{value:.1f} {CURRENCY}"
+        return f"{int(value)} {CURRENCY}" if float(value).is_integer() else f"{value:.1f} {CURRENCY}"
 
     def _reply_kb(self, rows: List[List[Dict[str, str]]], one_time: bool = False) -> Dict[str, Any]:
         return {
@@ -116,7 +116,6 @@ class FairBotLogic:
                 [
                     [{"label": "Команды", "cmd": "teams", "color": "primary"}],
                     [{"label": "Статистика", "cmd": "statistics", "color": "primary"}],
-                    [{"label": "Заявки сделок", "cmd": "pending_tx", "color": "positive"}],
                     [{"label": "Все сделки", "cmd": "transactions"}],
                     [{"label": "Настройки", "cmd": "settings"}, {"label": "Помощь", "cmd": "help"}],
                 ]
@@ -135,7 +134,6 @@ class FairBotLogic:
                         [{"label": "Код команды", "cmd": "team_code"}],
                         [{"label": edit_label, "cmd": "edit_team", "color": "primary"}],
                         [{"label": "Информация про лавки", "cmd": "shops_info"}],
-                        [{"label": "Другие команды", "cmd": "other_teams"}, {"label": "Ярмарка", "cmd": "buy_flow", "color": "positive"}],
                         [{"label": "Баланс", "cmd": "balance"}, {"label": "Профиль", "cmd": "profile"}],
                     ]
                 )
@@ -147,7 +145,6 @@ class FairBotLogic:
                 [
                     [{"label": "Моя команда", "cmd": "my_team", "color": "primary"}],
                     [{"label": "Участники", "cmd": "my_members"}, {"label": "Меню моей команды", "cmd": "my_team_menu"}],
-                    [{"label": "Список команд", "cmd": "buy_flow", "color": "positive"}],
                     [{"label": "Баланс", "cmd": "balance"}, {"label": "Профиль", "cmd": "profile"}],
                     [{"label": "Помощь", "cmd": "help"}],
                 ]
@@ -158,7 +155,8 @@ class FairBotLogic:
                 [
                     [{"label": "Список команд", "cmd": "view_flow", "color": "primary"}],
                     [{"label": "Меню команды", "cmd": "view_flow"}],
-                    [{"label": "Профиль", "cmd": "profile"}, {"label": "Помощь", "cmd": "help"}],
+                    [{"label": "Профиль", "cmd": "profile"}, {"label": "Настройки", "cmd": "settings"}],
+                    [{"label": "Помощь", "cmd": "help"}],
                 ]
             )
 
@@ -167,7 +165,7 @@ class FairBotLogic:
                 [{"label": "Начать", "cmd": "help", "color": "primary"}],
                 [{"label": "Ввести код команды", "cmd": "register", "color": "positive"}],
                 [{"label": "Я командир", "cmd": "commander_secret"}, {"label": "Фантом", "cmd": "be_phantom"}],
-                [{"label": "Список команд", "cmd": "view_flow"}, {"label": "Помощь", "cmd": "help"}],
+                [{"label": "Помощь", "cmd": "help"}],
             ]
         )
 
@@ -176,9 +174,11 @@ class FairBotLogic:
 
     def _settings_kb(self, user_id: int) -> Dict[str, Any]:
         stopped = self.db.get_setting("fair_stopped", "0") == "1"
+        on_lunch = self.db.is_admin_on_lunch(user_id)
         rows = [
             [{"label": "Пауза покупок", "cmd": "cooldown"}],
             [{"label": "Запустить ярмарку" if stopped else "Остановить ярмарку", "cmd": "toggle_fair", "color": "negative" if not stopped else "positive"}],
+            [{"label": "Выйти с обеда" if on_lunch else "Уйти на обед", "cmd": "lunch_out" if on_lunch else "lunch_in", "color": "positive" if on_lunch else "negative"}],
         ]
         if self._is_super_admin_user(user_id):
             rows.append([{"label": "Добавить админа", "cmd": "add_admin"}, {"label": "Удалить админа", "cmd": "remove_admin"}])
@@ -191,6 +191,14 @@ class FairBotLogic:
         )
         return self._reply_kb(rows)
 
+    def _phantom_settings_kb(self) -> Dict[str, Any]:
+        return self._reply_kb(
+            [
+                [{"label": "Отказаться от роли фантома", "cmd": "leave_phantom", "color": "negative"}],
+                [{"label": "Назад", "cmd": "back"}],
+            ]
+        )
+
     def _commander_edit_kb(self) -> Dict[str, Any]:
         return self._reply_kb(
             [
@@ -201,11 +209,18 @@ class FairBotLogic:
             ]
         )
 
-    def handle_message(self, user_id: int, text: str, payload: Optional[Any] = None) -> None:
+    def handle_message(self, user_id: int, text: str, payload: Optional[Any] = None, user_info: Optional[Dict[str, str]] = None) -> None:
         try:
             text = (text or "").strip()
             payload_dict = self._parse_payload(payload)
-            user = self.db.ensure_user(user_id)
+            user = self.db.ensure_user(
+                user_id,
+                tag=(user_info or {}).get("screen_name"),
+                display_name=(user_info or {}).get("display_name"),
+            )
+            if self._is_super_admin_user(user_id) and user.get("role") != "admin":
+                self.db.set_role(user_id, "admin")
+                user = self.db.get_user(user_id) or user
             role = user["role"] if user else "unregistered"
             state_data = self._get_state(user_id)
             state = state_data["state"]
@@ -222,7 +237,7 @@ class FairBotLogic:
                 self._clear_state(user_id)
                 return self.send(user_id, "Действие отменено.", self._main_kb(role, user))
 
-            if self._fair_is_stopped(role):
+            if self._fair_is_stopped(role) and not (role == "phantom" and cmd in ("settings", "leave_phantom")):
                 self._clear_state(user_id)
                 return self.send(user_id, "Ярмарка временно остановлена админом. Действия пользователей недоступны.", self._main_kb(role, user))
 
@@ -275,6 +290,9 @@ class FairBotLogic:
         try:
             payload = self._parse_payload(payload)
             user = self.db.ensure_user(user_id)
+            if self._is_super_admin_user(user_id) and user.get("role") != "admin":
+                self.db.set_role(user_id, "admin")
+                user = self.db.get_user(user_id) or user
             role = user["role"]
             action = payload.get("action")
 
@@ -287,6 +305,20 @@ class FairBotLogic:
                 return self._verify_team(user_id, role, int(payload["team_id"]), True)
             if action == "reject_team":
                 return self._verify_team(user_id, role, int(payload["team_id"]), False)
+            if action == "verify_shop":
+                return self._verify_shop(user_id, role, int(payload["shop_id"]), True)
+            if action == "reject_shop":
+                return self._delete_shop(user_id, role, int(payload["shop_id"]), rejected=True)
+            if action == "admin_delete_shop":
+                return self._delete_shop(user_id, role, int(payload["shop_id"]))
+            if action == "admin_ban_shop":
+                return self._toggle_shop_ban(user_id, role, int(payload["shop_id"]))
+            if action == "verify_item":
+                return self._verify_item(user_id, role, int(payload["item_id"]), True)
+            if action == "reject_item":
+                return self._delete_item(user_id, role, int(payload["item_id"]), rejected=True)
+            if action == "admin_delete_item":
+                return self._delete_item(user_id, role, int(payload["item_id"]))
             if action == "team":
                 return self._select_team(user_id, role, int(payload["team_id"]), payload.get("mode"))
             if action == "shop":
@@ -344,12 +376,18 @@ class FairBotLogic:
                 return self.send(user_id, "У вас нет команды.", self._main_kb(role, user))
             return self.send(user_id, f"Баланс команды: {self._money(self.db.get_team_balance(user['team_id']))}.", self._main_kb(role, user))
         if cmd == "other_teams":
+            if role not in ("admin", "phantom"):
+                return self.send(user_id, "Информация о других командах доступна только админам и фантомам.", self._main_kb(role, user))
             self._set_state(user_id, S["VIEW_TEAM"])
             return self._send_team_list(user_id, role, "view")
         if cmd == "view_flow":
+            if role not in ("admin", "phantom"):
+                return self.send(user_id, "Информация о командах доступна только админам и фантомам.", self._main_kb(role, user))
             self._set_state(user_id, S["VIEW_TEAM"])
             return self._send_team_list(user_id, role, "view")
         if cmd == "buy_flow":
+            if role not in ("admin", "phantom"):
+                return self.send(user_id, "Информация о других командах недоступна для вашей роли.", self._main_kb(role, user))
             if role == "phantom":
                 return self.send(user_id, "Фантомные пользователи могут смотреть анкеты, но не покупать.", self._main_kb(role, user))
             self._set_state(user_id, S["BUY_TEAM"])
@@ -361,10 +399,19 @@ class FairBotLogic:
                 return self.send(user_id, "Введите числовой код команды:", self._wait_kb())
             if cmd == "commander_secret":
                 self._set_state(user_id, S["WAIT_COMMANDER_SECRET"])
-                return self.send(user_id, "Введите специальный код командира:", self._wait_kb())
+                return self.send(user_id, "Введите одноразовый числовой код командира:", self._wait_kb())
             if cmd == "be_phantom":
-                self.db.set_role(user_id, "phantom")
-                return self.send(user_id, "Вы зарегистрированы как фантомный пользователь.", self._main_kb("phantom", self.db.get_user(user_id)))
+                self._set_state(user_id, S["WAIT_PHANTOM_TAG"])
+                return self.send(user_id, "Введите одноразовый числовой код фантома:", self._wait_kb())
+
+        if role == "phantom":
+            if cmd == "settings":
+                return self.send(user_id, "Настройки фантома", self._phantom_settings_kb())
+            if cmd == "leave_phantom":
+                self.db.leave_phantom(user_id)
+                self._clear_state(user_id)
+                new_user = self.db.get_user(user_id)
+                return self.send(user_id, "Роль фантома снята. Вы снова можете зарегистрироваться обычным способом.", self._main_kb("unregistered", new_user))
 
         if role == "commander":
             if cmd == "create_team":
@@ -389,7 +436,7 @@ class FairBotLogic:
                 return self._send_members(user_id, role, user["team_id"])
             if cmd == "add_member":
                 self._set_state(user_id, S["WAIT_ADD_MEMBER"])
-                return self.send(user_id, "Введите участника в формате: @tag Имя", self._wait_kb())
+                return self.send(user_id, "Введите участника в едином формате: тег имя. Например: id123456 Иван Иванов.", self._wait_kb())
             if cmd == "remove_member":
                 self._set_state(user_id, S["WAIT_REMOVE_MEMBER"])
                 return self.send(user_id, "Введите тег участника для удаления из анкеты:", self._wait_kb())
@@ -424,6 +471,12 @@ class FairBotLogic:
                 self.db.set_setting("fair_stopped", "0" if stopped else "1")
                 status = "запущена" if stopped else "остановлена"
                 return self.send(user_id, f"Ярмарка {status}.", self._settings_kb(user_id))
+            if cmd == "lunch_in":
+                self.db.set_admin_lunch(user_id, True)
+                return self.send(user_id, "Вы ушли на обед. Новые заявки будут назначаться другим активным админам.", self._settings_kb(user_id))
+            if cmd == "lunch_out":
+                self.db.set_admin_lunch(user_id, False)
+                return self.send(user_id, "Вы вернулись с обеда. Новые заявки снова могут приходить вам.", self._settings_kb(user_id))
             if cmd == "add_admin":
                 if not self._is_super_admin_user(user_id):
                     return self.send(user_id, "Добавлять админов может только суперадмин.", self._main_kb(role, user))
@@ -443,10 +496,10 @@ class FairBotLogic:
                 return self.send(user_id, "Введите тег пользователя:", self._wait_kb())
             if cmd == "make_phantom":
                 self._set_state(user_id, S["WAIT_PHANTOM_TAG"])
-                return self.send(user_id, "Введите тег, который станет фантомным пользователем:", self._wait_kb())
+                return self.send(user_id, "Введите одноразовый числовой код для фантома:", self._wait_kb())
             if cmd == "grant_commander":
                 self._set_state(user_id, S["WAIT_COMMANDER_TAG"])
-                return self.send(user_id, "Введите тег будущего командира:", self._wait_kb())
+                return self.send(user_id, "Введите одноразовый числовой код для командира:", self._wait_kb())
             if cmd == "cooldown":
                 self._set_state(user_id, S["WAIT_COOLDOWN"])
                 return self.send(user_id, "Введите паузу между покупками в секундах:", self._wait_kb())
@@ -457,11 +510,18 @@ class FairBotLogic:
         user = self.db.get_user(user_id)
 
         if state == S["WAIT_COMMANDER_SECRET"]:
-            if text.strip() != self.db.get_setting("commander_secret", "1111"):
-                return self.send(user_id, "Неверный код командира.", self._wait_kb())
-            self.db.set_role(user_id, "commander")
+            ok, msg = self.db.consume_role_key(user_id, "commander", text)
+            if not ok:
+                return self.send(user_id, msg, self._wait_kb())
             self._clear_state(user_id)
             return self.send(user_id, "Права командира выданы. Теперь можно создать анкету команды.", self._main_kb("commander", self.db.get_user(user_id)))
+
+        if state == S["WAIT_PHANTOM_TAG"] and role != "admin":
+            ok, msg = self.db.consume_role_key(user_id, "phantom", text)
+            if not ok:
+                return self.send(user_id, msg, self._wait_kb())
+            self._clear_state(user_id)
+            return self.send(user_id, "Вы зарегистрированы как фантомный пользователь.", self._main_kb("phantom", self.db.get_user(user_id)))
 
         if state == S["WAIT_REGISTER_CODE"]:
             ok, msg = self.db.try_register_by_code(user_id, text)
@@ -477,15 +537,22 @@ class FairBotLogic:
             team_id = self.db.create_team(text, user_id)
             team = self.db.get_team(team_id)
             self._clear_state(user_id)
+            self._notify_team_review(team_id)
             return self.send(user_id, f"Анкета создана.\nID команды: {team_id}\nКод регистрации: {team['reg_code']}\nАдмин должен одобрить анкету перед продажами.", self._main_kb("commander", self.db.get_user(user_id)))
 
         if state == S["WAIT_ADD_MEMBER"]:
             parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                self._clear_state(user_id)
+                return self.send(user_id, "Ошибка ввода участника. Формат: тег имя.", self._commander_edit_kb())
             tag = parts[0]
             name = parts[1] if len(parts) > 1 else ""
-            self.db.add_allowed_member(user["team_id"], tag, name)
+            ok, msg = self.db.add_allowed_member(user["team_id"], tag, name)
+            if not ok:
+                self._clear_state(user_id)
+                return self.send(user_id, msg, self._commander_edit_kb())
             self._clear_state(user_id)
-            return self.send(user_id, f"Участник {tag} добавлен в анкету.", self._main_kb(role, user))
+            return self.send(user_id, msg, self._main_kb(role, user))
 
         if state == S["WAIT_REMOVE_MEMBER"]:
             self.db.remove_allowed_member(user["team_id"], text)
@@ -495,7 +562,8 @@ class FairBotLogic:
         if state == S["WAIT_SHOP_NAME"]:
             shop_id = self.db.create_shop(user["team_id"], text)
             self._clear_state(user_id)
-            return self.send(user_id, f"Лавка создана. ID: {shop_id}", self._main_kb(role, user))
+            self._notify_shop_review(shop_id)
+            return self.send(user_id, f"Лавка отправлена на одобрение админу. ID: {shop_id}", self._main_kb(role, user))
 
         if state == S["WAIT_ITEM_NAME"]:
             ctx["name"] = text
@@ -503,10 +571,18 @@ class FairBotLogic:
             return self.send(user_id, f"Введите цену в {CURRENCY}:", self._wait_kb())
 
         if state == S["WAIT_ITEM_PRICE"]:
-            price = float(text.replace(",", "."))
-            self.db.add_item(ctx["shop_id"], ctx["name"], price)
+            try:
+                price = float(text.replace(",", "."))
+            except ValueError:
+                self._clear_state(user_id)
+                return self.send(user_id, "Ошибка ввода цены. Введите целое число больше нуля.", self._commander_edit_kb())
+            if price <= 0 or int(price) != price:
+                self._clear_state(user_id)
+                return self.send(user_id, "Ошибка ввода цены. Цена должна быть целым числом больше нуля.", self._commander_edit_kb())
+            item_id = self.db.add_item(ctx["shop_id"], ctx["name"], price)
             self._clear_state(user_id)
-            return self.send(user_id, "Товар или услуга добавлены.", self._main_kb(role, user))
+            self._notify_item_review(item_id)
+            return self.send(user_id, "Товар или услуга отправлены на одобрение админу.", self._main_kb(role, user))
 
         if role == "admin":
             return self._handle_admin_state(user_id, role, text, state, ctx)
@@ -519,6 +595,8 @@ class FairBotLogic:
             if not self._is_super_admin_user(user_id):
                 self._clear_state(user_id)
                 return self.send(user_id, "Добавлять админов может только суперадмин.", self._main_kb(role, self.db.get_user(user_id)))
+            if not text.strip().isdigit():
+                return self.send(user_id, "Введите числовой VK user_id.", self._wait_kb())
             new_admin = int(text)
             self.db.set_role(new_admin, "admin")
             self._clear_state(user_id)
@@ -528,6 +606,8 @@ class FairBotLogic:
             if not self._is_super_admin_user(user_id):
                 self._clear_state(user_id)
                 return self.send(user_id, "Удалять админов может только суперадмин.", self._main_kb(role, self.db.get_user(user_id)))
+            if not text.strip().isdigit():
+                return self.send(user_id, "Введите числовой VK user_id.", self._wait_kb())
             admin_id = int(text)
             if admin_id == config.INITIAL_SUPER_ADMIN:
                 return self.send(user_id, "Суперадмина нельзя удалить через бота. Уберите его из .env, если нужно отключить.", self._wait_kb())
@@ -548,19 +628,26 @@ class FairBotLogic:
             return self.send(user_id, msg, self._main_kb(role, self.db.get_user(user_id)))
 
         if state == S["WAIT_PHANTOM_TAG"]:
-            placeholder = self.db.set_role_by_tag(text, "phantom")
+            ok, result = self.db.add_role_key("phantom", text, user_id)
+            if not ok:
+                return self.send(user_id, result, self._wait_kb())
             self._clear_state(user_id)
-            return self.send(user_id, f"Тег {text} отмечен как фантом. Внутренний ID: {placeholder}", self._main_kb(role, self.db.get_user(user_id)))
+            return self.send(user_id, f"Одноразовый код фантома создан: {result}", self._main_kb(role, self.db.get_user(user_id)))
 
         if state == S["WAIT_COMMANDER_TAG"]:
-            placeholder = self.db.set_role_by_tag(text, "commander")
+            ok, result = self.db.add_role_key("commander", text, user_id)
+            if not ok:
+                return self.send(user_id, result, self._wait_kb())
             self._clear_state(user_id)
-            return self.send(user_id, f"Тег {text} получил роль командира. Внутренний ID: {placeholder}", self._main_kb(role, self.db.get_user(user_id)))
+            return self.send(user_id, f"Одноразовый код командира создан: {result}", self._main_kb(role, self.db.get_user(user_id)))
 
         if state == S["WAIT_FINE_AMOUNT"]:
-            amount = float(text.replace(",", "."))
+            try:
+                amount = float(text.replace(",", "."))
+            except ValueError:
+                return self.send(user_id, "Введите сумму штрафа числом.", self._wait_kb())
             if amount <= 0:
-                raise ValueError
+                return self.send(user_id, "Сумма штрафа должна быть больше нуля.", self._wait_kb())
             ctx["amount"] = amount
             self._set_state(user_id, S["WAIT_FINE_REASON"], ctx)
             return self.send(user_id, "Введите причину штрафа:", self._wait_kb())
@@ -571,17 +658,23 @@ class FairBotLogic:
             return self.send(user_id, f"Штраф {self._money(ctx['amount'])} применен.", self._main_kb(role, self.db.get_user(user_id)))
 
         if state == S["WAIT_BAN_TEAM"]:
+            if not text.strip().isdigit():
+                return self.send(user_id, "Введите числовой ID команды.", self._wait_kb())
             return self._toggle_team_ban(user_id, role, int(text))
 
         if state == S["WAIT_COOLDOWN"]:
+            if not text.strip().isdigit():
+                return self.send(user_id, "Введите паузу числом в секундах.", self._wait_kb())
             sec = int(text)
             if sec < 0:
-                raise ValueError
+                return self.send(user_id, "Пауза не может быть отрицательной.", self._wait_kb())
             self.db.set_setting("purchase_cooldown", str(sec))
             self._clear_state(user_id)
             return self.send(user_id, f"Пауза покупок: {sec} сек.", self._settings_kb(user_id))
 
     def _send_team_list(self, user_id: int, role: str, mode: str):
+        if role not in ("admin", "phantom"):
+            return self.send(user_id, "Информация о командах доступна только админам и фантомам.", self._main_kb(role, self.db.get_user(user_id)))
         teams = self.db.list_teams(verified_only=(mode != "admin"))
         if not teams:
             return self.send(user_id, "Команд пока нет.", self._main_kb(role, self.db.get_user(user_id)))
@@ -608,6 +701,10 @@ class FairBotLogic:
         return self.send(user_id, "Команды и заявки анкет:", self._inline_kb(buttons))
 
     def _select_team(self, user_id: int, role: str, team_id: int, mode: Optional[str] = None):
+        if role not in ("admin", "phantom"):
+            user = self.db.get_user(user_id)
+            if not user or user.get("team_id") != team_id:
+                return self.send(user_id, "Информация о других командах недоступна для вашей роли.", self._main_kb(role, user))
         if role == "admin":
             mode = "admin"
         elif mode == "admin":
@@ -618,12 +715,25 @@ class FairBotLogic:
 
         self._send_team_card(user_id, role, team_id)
 
-        shops = self.db.list_shops(team_id)
+        shops = self.db.list_shops(team_id, verified_only=(mode != "admin"))
         buttons = []
         for shop in shops:
-            buttons.append({"label": shop["name"], "payload": {"action": "shop", "team_id": team_id, "shop_id": shop["id"], "mode": mode}, "color": "primary"})
+            status = ""
             if mode == "admin":
+                flags = []
+                if not shop.get("is_verified"):
+                    flags.append("ждет")
+                if shop.get("is_banned"):
+                    flags.append("бан")
+                status = f" ({', '.join(flags)})" if flags else ""
+            buttons.append({"label": f"{shop['name']}{status}", "payload": {"action": "shop", "team_id": team_id, "shop_id": shop["id"], "mode": mode}, "color": "primary"})
+            if mode == "admin":
+                if not shop.get("is_verified"):
+                    buttons.append({"label": f"Одобрить лавку: {shop['name']}", "payload": {"action": "verify_shop", "shop_id": shop["id"]}, "color": "positive"})
+                    buttons.append({"label": f"Отклонить лавку: {shop['name']}", "payload": {"action": "reject_shop", "shop_id": shop["id"]}, "color": "negative"})
                 buttons.append({"label": f"Штраф: {shop['name']}", "payload": {"action": "admin_fine_shop", "team_id": team_id, "shop_id": shop["id"]}, "color": "negative"})
+                buttons.append({"label": f"{'Разбанить' if shop.get('is_banned') else 'Забанить'}: {shop['name']}", "payload": {"action": "admin_ban_shop", "shop_id": shop["id"]}, "color": "negative"})
+                buttons.append({"label": f"Удалить лавку: {shop['name']}", "payload": {"action": "admin_delete_shop", "shop_id": shop["id"]}, "color": "negative"})
 
         if mode == "admin":
             team = self.db.get_team(team_id)
@@ -640,13 +750,19 @@ class FairBotLogic:
         self.send(user_id, "Лавки и действия:" if mode == "admin" else "Выберите лавку:", self._inline_kb(buttons))
 
     def _select_shop(self, user_id: int, role: str, shop_id: int, team_id: int, mode: str):
-        items = self.db.list_items(shop_id)
+        items = self.db.list_items(shop_id, verified_only=(mode != "admin"))
         if not items:
             return self.send(user_id, "В лавке пока нет товаров или услуг.")
         buttons = []
         for item in items:
             payload = {"action": "buy_item", "item_id": item["id"]} if mode == "buy" else {"action": "noop"}
-            buttons.append({"label": f"{item['name']} - {self._money(item['price'])}", "payload": payload, "color": "positive" if mode == "buy" else "secondary"})
+            status = " (ждет)" if mode == "admin" and not item.get("is_verified") else ""
+            buttons.append({"label": f"{item['name']} - {self._money(item['price'])}{status}", "payload": payload, "color": "positive" if mode == "buy" else "secondary"})
+            if mode == "admin":
+                if not item.get("is_verified"):
+                    buttons.append({"label": f"Одобрить: {item['name']}", "payload": {"action": "verify_item", "item_id": item["id"]}, "color": "positive"})
+                    buttons.append({"label": f"Отклонить: {item['name']}", "payload": {"action": "reject_item", "item_id": item["id"]}, "color": "negative"})
+                buttons.append({"label": f"Убрать: {item['name']}", "payload": {"action": "admin_delete_item", "item_id": item["id"]}, "color": "negative"})
         self._set_state(user_id, S["BUY_ITEM"] if mode == "buy" else S["VIEW_SHOP"], {"team_id": team_id, "shop_id": shop_id})
         self.send(user_id, "Товары и услуги:", self._inline_kb(buttons))
 
@@ -670,7 +786,9 @@ class FairBotLogic:
         self.send(user_id, f"Заявка на покупку «{item['name']}» отправлена админу.", self._main_kb(role, self.db.get_user(user_id)))
 
     def _send_team_card(self, user_id: int, role: str, team_id: int):
-        team = self.db.get_team_structure(team_id)
+        viewer = self.db.get_user(user_id)
+        include_pending = role == "admin" or bool(viewer and viewer.get("role") == "commander" and viewer.get("team_id") == team_id)
+        team = self.db.get_team_structure(team_id, include_pending=include_pending)
         if not team:
             return self.send(user_id, "Команда не найдена.")
         lines = [
@@ -687,9 +805,16 @@ class FairBotLogic:
         lines.append("Лавки:")
         if team["shops"]:
             for shop in team["shops"]:
-                lines.append(f"- {shop['name']} (ID {shop['id']}), баланс {self._money(shop['balance'])}")
+                flags = []
+                if include_pending and not shop.get("is_verified"):
+                    flags.append("ждет одобрения")
+                if include_pending and shop.get("is_banned"):
+                    flags.append("бан")
+                status = f" [{', '.join(flags)}]" if flags else ""
+                lines.append(f"- {shop['name']} (ID {shop['id']}){status}, баланс {self._money(shop['balance'])}")
                 for item in shop["items"]:
-                    lines.append(f"  - {item['name']}: {self._money(item['price'])}")
+                    item_status = " [ждет одобрения]" if include_pending and not item.get("is_verified") else ""
+                    lines.append(f"  - {item['name']}: {self._money(item['price'])}{item_status}")
         else:
             lines.append("- пока нет")
         self.send(user_id, "\n".join(lines), self._main_kb(role, self.db.get_user(user_id)))
@@ -719,7 +844,7 @@ class FairBotLogic:
         self.send(user_id, "\n".join(lines), self._main_kb(role, self.db.get_user(user_id)))
 
     def _send_shops_info(self, user_id: int, role: str, team_id: int):
-        team = self.db.get_team_structure(team_id)
+        team = self.db.get_team_structure(team_id, include_pending=(role in ("admin", "commander")))
         if not team:
             return self.send(user_id, "Команда не найдена.", self._main_kb(role, self.db.get_user(user_id)))
 
@@ -787,7 +912,11 @@ class FairBotLogic:
             return self.send(user_id, "Сделок пока нет.", self._main_kb(role, self.db.get_user(user_id)))
         lines = ["Последние сделки:"]
         for tx in txs:
-            lines.append(f"#{tx['id']} команда {tx['team_id']}, лавка {tx['shop_id']}, {self._money(tx['amount'])}, {tx['status']}, админ {tx['assigned_admin_id']}")
+            lines.append(
+                f"#{tx['id']} покупатель {self.db.user_label(tx['buyer_id'])}, "
+                f"команда {tx['team_id']}, лавка {tx['shop_id']}, {self._money(tx['amount'])}, "
+                f"{tx['status']}, админ {self.db.user_label(tx['assigned_admin_id'])}"
+            )
         self.send(user_id, "\n".join(lines), self._main_kb(role, self.db.get_user(user_id)))
 
     def _handle_admin_transaction(self, user_id: int, role: str, tx_id: int, approved: bool):
@@ -806,7 +935,7 @@ class FairBotLogic:
         item = self.db.get_item_for_purchase(tx["item_id"])
         text = (
             f"Новая сделка #{tx['id']}\n"
-            f"Покупатель: {tx['buyer_id']}\n"
+            f"Покупатель: {self.db.user_label(tx['buyer_id'])}\n"
             f"Команда: {item['team_name'] if item else tx['team_id']}\n"
             f"Лавка: {item['shop_name'] if item else tx['shop_id']}\n"
             f"Товар: {item['name'] if item else tx['item_id']}\n"
@@ -819,6 +948,128 @@ class FairBotLogic:
             ]
         )
         self.send(tx["assigned_admin_id"], text, kb)
+
+    def _notify_admins(self, text: str, keyboard: Dict[str, Any]):
+        admin_id = self.db.next_available_admin()
+        if admin_id:
+            self.send(admin_id, text, keyboard)
+
+    def _notify_team_review(self, team_id: int):
+        team = self.db.get_team(team_id)
+        if not team:
+            return
+        text = (
+            f"Новая команда на одобрение\n"
+            f"Команда: {team['name']} (ID {team_id})\n"
+            f"Командир: {self.db.user_label(team['commander_id'])}"
+        )
+        kb = self._inline_kb(
+            [
+                {"label": "Одобрить команду", "payload": {"action": "verify_team", "team_id": team_id}, "color": "positive"},
+                {"label": "Отклонить команду", "payload": {"action": "reject_team", "team_id": team_id}, "color": "negative"},
+            ]
+        )
+        self._notify_admins(text, kb)
+
+    def _notify_shop_review(self, shop_id: int):
+        shop = self.db.get_shop(shop_id)
+        if not shop:
+            return
+        team = self.db.get_team(shop["team_id"])
+        text = (
+            f"Новая лавка на одобрение\n"
+            f"Команда: {team['name'] if team else shop['team_id']}\n"
+            f"Лавка: {shop['name']} (ID {shop_id})"
+        )
+        kb = self._inline_kb(
+            [
+                {"label": "Одобрить лавку", "payload": {"action": "verify_shop", "shop_id": shop_id}, "color": "positive"},
+                {"label": "Отклонить лавку", "payload": {"action": "reject_shop", "shop_id": shop_id}, "color": "negative"},
+            ]
+        )
+        self._notify_admins(text, kb)
+
+    def _notify_item_review(self, item_id: int):
+        item = self.db.get_item(item_id)
+        if not item:
+            return
+        shop = self.db.get_shop(item["shop_id"])
+        team = self.db.get_team(shop["team_id"]) if shop else None
+        text = (
+            f"Новый товар/услуга на одобрение\n"
+            f"Команда: {team['name'] if team else '-'}\n"
+            f"Лавка: {shop['name'] if shop else item['shop_id']}\n"
+            f"Позиция: {item['name']}\n"
+            f"Цена: {self._money(item['price'])}"
+        )
+        kb = self._inline_kb(
+            [
+                {"label": "Одобрить", "payload": {"action": "verify_item", "item_id": item_id}, "color": "positive"},
+                {"label": "Отклонить", "payload": {"action": "reject_item", "item_id": item_id}, "color": "negative"},
+            ]
+        )
+        self._notify_admins(text, kb)
+
+    def _verify_shop(self, user_id: int, role: str, shop_id: int, approve: bool):
+        if role != "admin":
+            return self.send(user_id, "Недостаточно прав.")
+        shop = self.db.get_shop(shop_id)
+        if not shop:
+            return self.send(user_id, "Лавка не найдена.", self._main_kb(role, self.db.get_user(user_id)))
+        ok = self.db.verify_shop(shop_id, approve)
+        team = self.db.get_team(shop["team_id"])
+        if ok and team:
+            self.send(team["commander_id"], f"Лавка «{shop['name']}» одобрена.")
+        self.send(user_id, "Лавка одобрена." if ok else "Лавка не найдена.", self._main_kb(role, self.db.get_user(user_id)))
+
+    def _delete_shop(self, user_id: int, role: str, shop_id: int, rejected: bool = False):
+        if role != "admin":
+            return self.send(user_id, "Недостаточно прав.")
+        shop = self.db.get_shop(shop_id)
+        ok = self.db.delete_shop(shop_id)
+        if shop:
+            team = self.db.get_team(shop["team_id"])
+            if team:
+                self.send(team["commander_id"], f"Лавка «{shop['name']}» {'отклонена' if rejected else 'удалена админом'}.")
+        self.send(user_id, ("Лавка отклонена." if rejected else "Лавка удалена.") if ok else "Лавка не найдена.", self._main_kb(role, self.db.get_user(user_id)))
+
+    def _toggle_shop_ban(self, user_id: int, role: str, shop_id: int):
+        if role != "admin":
+            return self.send(user_id, "Недостаточно прав.")
+        shop = self.db.get_shop(shop_id)
+        if not shop:
+            return self.send(user_id, "Лавка не найдена.", self._main_kb(role, self.db.get_user(user_id)))
+        new_state = not bool(shop.get("is_banned"))
+        self.db.toggle_shop_ban(shop_id, new_state)
+        team = self.db.get_team(shop["team_id"])
+        if team:
+            self.send(team["commander_id"], f"Лавка «{shop['name']}» {'забанена' if new_state else 'разбанена'}.")
+        self.send(user_id, "Лавка забанена." if new_state else "Лавка разбанена.", self._main_kb(role, self.db.get_user(user_id)))
+
+    def _verify_item(self, user_id: int, role: str, item_id: int, approve: bool):
+        if role != "admin":
+            return self.send(user_id, "Недостаточно прав.")
+        item = self.db.get_item(item_id)
+        if not item:
+            return self.send(user_id, "Товар/услуга не найдены.", self._main_kb(role, self.db.get_user(user_id)))
+        ok = self.db.verify_item(item_id, approve)
+        shop = self.db.get_shop(item["shop_id"])
+        team = self.db.get_team(shop["team_id"]) if shop else None
+        if ok and team:
+            self.send(team["commander_id"], f"Товар/услуга «{item['name']}» одобрены.")
+        self.send(user_id, "Товар/услуга одобрены." if ok else "Товар/услуга не найдены.", self._main_kb(role, self.db.get_user(user_id)))
+
+    def _delete_item(self, user_id: int, role: str, item_id: int, rejected: bool = False):
+        if role != "admin":
+            return self.send(user_id, "Недостаточно прав.")
+        item = self.db.get_item(item_id)
+        ok = self.db.delete_item(item_id)
+        if item:
+            shop = self.db.get_shop(item["shop_id"])
+            team = self.db.get_team(shop["team_id"]) if shop else None
+            if team:
+                self.send(team["commander_id"], f"Товар/услуга «{item['name']}» {'отклонены' if rejected else 'убраны админом'}.")
+        self.send(user_id, ("Товар/услуга отклонены." if rejected else "Товар/услуга убраны.") if ok else "Товар/услуга не найдены.", self._main_kb(role, self.db.get_user(user_id)))
 
     def _verify_team(self, user_id: int, role: str, team_id: int, approve: bool):
         if role != "admin":
